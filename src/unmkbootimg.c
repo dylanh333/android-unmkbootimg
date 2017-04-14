@@ -1,158 +1,147 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <errno.h>
 #include <stdbool.h>
+#include <string.h>
+#include <errno.h>
 #include "bootimg.h"
 
-#define PATHLEN 256
+#define PATHLEN_MAX 256
 
-boot_img_hdr *readHeader(boot_img_hdr *buffer, FILE *srcFile){
+#define throwError(message, ...) {\
+    fprintf(stderr, "Error in %s(): " message "\n", __func__, ##__VA_ARGS__);\
+    exit(EXIT_FAILURE);\
+}
+
+FILE *openFile(const char *path, const char *mode){
+    FILE *file = NULL; errno = 0;
+    file = fopen(path, mode);
+    if(errno) throwError(
+        "Failed to open \"%s\" in \"%s\" mode. %s",
+        path, mode, strerror(errno)
+    );
+    return file;
+}
+
+void readHeader(boot_img_hdr *header, FILE *srcFile){
+    errno = 0;
+
     rewind(srcFile);
-    if(!fread(buffer, sizeof(boot_img_hdr), 1, srcFile)){
-        if(feof(srcFile)){
-            fprintf(stderr,
-                "Error: end of file reached prematurely while reading header\n"
-            );
-        }else{
-            fprintf(stderr, "Error: error encountered while reading header\n");
-        }
-        return NULL;
-    }
+    if(errno) throwError("Failed to rewind to start. %s", strerror(errno));
 
-    return buffer;
+    fread(header, sizeof(boot_img_hdr), 1, srcFile);
+    if(errno) throwError("Failed to read header. %s", strerror(errno));
 }
 
-bool dd(
-    FILE *srcFile, char *dest, size_t blockSize, size_t count, size_t skip
-){
-    bool error = false;
-    FILE *destFile = NULL;
-    void *buffer = NULL;
+void getPageMap(uint32_t pageMap[4], const boot_img_hdr *header){
+    uint32_t pageSize = header->page_size, sizeInBytes;
 
-    if(!(destFile = fopen(dest, "w"))){
-        fprintf(stderr, "Error: could not open \"%s\" for writing\n", dest);
-        error = true;
-    }
-
-    if(!error){
-        if(!(buffer = calloc(1, blockSize))){
-            fprintf(
-                stderr,
-                "Error: failed to allocate memory of %lluB\n",
-                (unsigned long long)blockSize
-            );
-            error = true;
-        }
-    }
-
-    if(!error){
-        fseek(srcFile, (long)(blockSize * skip), SEEK_SET);
-        for(size_t i = 0; i < count; i++){
-            if(!fread(buffer, blockSize, 1, srcFile)){
-                fprintf(
-                    stderr,
-                    "Error: failed to read in a full block of size %lluB from "
-                    "srcFile at offset %lluB\n",
-                    (unsigned long long)blockSize,
-                    (unsigned long long)((skip + i) * blockSize)
-                );
-                error = true;
+    for(uint32_t i = 0; i < 4; i++){
+        switch(i){
+            case 1:
+                sizeInBytes = header->kernel_size;
+                if(!sizeInBytes) throwError("invalid kernel_size");
                 break;
-            }
-            if(!fwrite(buffer, blockSize, 1, destFile)){
-                fprintf(
-                    stderr,
-                    "Error: failed to write a full block of size %lluB to "
-                    "destFile at offset %lluB\n",
-                    (unsigned long long)blockSize,
-                    (unsigned long long)(i * blockSize)
-                );
-                error = true;
+            case 2:
+                sizeInBytes = header->ramdisk_size;
+                if(!sizeInBytes) throwError("invalid ramdisk_size");
                 break;
-            }
-        }
-    }
-
-    if(destFile) fclose(destFile);
-    if(buffer) free(buffer);
-
-    return !error;
-}
-
-bool extract(FILE *srcFile, char *dest, char what, boot_img_hdr *header){
-    bool error = false;
-
-    size_t
-        pageSize = header->page_size,
-        kernelPageOffset = 1,
-        kernelPageCount = (header->kernel_size + pageSize - 1) / pageSize,
-        ramdiskPageOffset = kernelPageOffset + kernelPageCount,
-        ramdiskPageCount = (header->ramdisk_size + pageSize - 1) / pageSize,
-        secondPageOffset = ramdiskPageOffset + ramdiskPageCount,
-        secondPageCount = (header->second_size + pageSize - 1) / pageSize
-    ;
-
-    if(pageSize > 65536){
-        fprintf(
-            stderr,
-            "Error: excessive page_size of %llu provided in header\n",
-            (unsigned long long)header->page_size
-        );
-        error = true;
-    }
-
-    if(!error){
-        switch(what){
-            case 'k':
-                error = !dd(srcFile, dest, pageSize, kernelPageCount, kernelPageOffset);
-                break;
-            case 'r':
-                error = !dd(srcFile, dest, pageSize, ramdiskPageCount, ramdiskPageOffset);
-                break;
-            case 's':
-                if(!header->second_size) break;
-                error = !dd(srcFile, dest, pageSize, secondPageCount, secondPageOffset);
+            case 3:
+                sizeInBytes = header->second_size;
                 break;
             default:
-                fprintf(stderr, "Error: invalid 'what' value provided to extract\n");
-                error = true;
+                sizeInBytes = pageSize; break;
         }
+        pageMap[i] = (sizeInBytes + pageSize - 1) / pageSize;
+    }
+}
+
+void printPageMap(uint32_t pageMap[4]){
+    for(char i = 0; i < 4; i++){
+        char *label;
+        switch(i){
+            case 0: label = "header"; break;
+            case 1: label = "kernel"; break;
+            case 2: label = "ramdisk"; break;
+            case 3: label = "second"; break;
+            default: "";
+        }
+        printf(
+            "Size of \"%s\" slice: %u page%s\n",
+            label, pageMap[i], pageMap[i] == 1 ? "" : "s"
+        );
+    }
+}
+
+void writeSlice(
+    FILE *srcFile, FILE *destFile,
+    size_t pageSize, size_t pageCount, size_t offset
+){
+    void *buffer = NULL;
+    if(!(buffer = calloc(1, pageSize)))
+        throwError("Failed to allocate buffer. %s", strerror(errno));
+
+    fseek(srcFile, (long)(pageSize * offset), SEEK_SET);
+    for(size_t i = 0; i < pageCount; i++){
+        if(!fread(buffer, pageSize, 1, srcFile))
+            throwError(
+                "Failed to read an entire page at offset %lluB. %s",
+                (unsigned long long)((offset + i) * pageSize),
+                strerror(errno)
+            );
+
+        if(!fwrite(buffer, pageSize, 1, destFile))
+            throwError(
+                "Failed to write an entire page at offset %lluB. %s",
+                (unsigned long long)(i * pageSize),
+                strerror(errno)
+            );
     }
 
-    return !error;
+    free(buffer);
 }
 
 int main(int argsLen, char **args){
+    char src[PATHLEN_MAX] = "";
+    char dests[][PATHLEN_MAX] = {
+        "parameters.txt",
+        "kernel.img",
+        "ramdisk.img",
+        "secondary.img",
+        ""
+    };
     char
-        src[PATHLEN] = "",
-        destKernel[PATHLEN] = "kernel.img",
-        destRamdisk[PATHLEN] = "ramdisk.img",
-        destSecondary[PATHLEN] = "secondary.img"
+        destKernel[PATHLEN_MAX] = "kernel.img",
+        destRamdisk[PATHLEN_MAX] = "ramdisk.img",
+        destSecondary[PATHLEN_MAX] = "secondary.img"
     ;
     boot_img_hdr header;
+    uint32_t pageMap[4];
 
-    if(argsLen < 2){
-        fprintf(stderr, "Error: src not specified\n");
-        exit(EXIT_FAILURE);
-    } else snprintf(src, PATHLEN, "%s", args[1]);
+    if(argsLen < 2) throwError("src not specified");
+    snprintf(src, PATHLEN_MAX, "%s", args[1]);
 
-    FILE *srcFile = NULL;
-    if(!(srcFile = fopen(src, "r"))){
-        fprintf(stderr, "Error: could not open \"%s\"\n", src);
-        exit(EXIT_FAILURE);
-    }
+    FILE *srcFile = openFile(src, "r");
 
     printf("Reading header...\n");
     readHeader(&header, srcFile);
+    printf("Page size: %uB\n", header.page_size);
 
-    printf("Extracting %s...\n", destKernel);
-    if(!extract(srcFile, destKernel, 'k', &header)) exit(EXIT_FAILURE);
+    getPageMap(pageMap, &header);
+    printPageMap(pageMap);
 
-    printf("Extracting %s...\n", destRamdisk);
-    if(!extract(srcFile, destRamdisk, 'r', &header)) exit(EXIT_FAILURE);
-
-    printf("Extracting %s...\n", destSecondary);
-    if(!extract(srcFile, destSecondary, 's', &header)) exit(EXIT_FAILURE);
+    for(size_t i = 0, offset = 0; dests[i][0] != '\0'; i++){
+        FILE *destFile;
+        if(pageMap[i] && i > 0){
+            printf("Extracting \"%s\"...\n", dests[i]);
+            destFile = openFile(dests[i], "w");
+            writeSlice(
+                srcFile, destFile,
+                header.page_size, pageMap[i], offset
+            );
+            fclose(destFile);
+        }
+        offset += pageMap[i];
+    }
 
     return EXIT_SUCCESS;
 }
