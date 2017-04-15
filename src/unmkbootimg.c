@@ -2,10 +2,11 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
+#include <limits.h>
+#include <unistd.h>
 #include "bootimg.h"
-
-#define PATHLEN_MAX 256
 
 #define throwError(message, ...) {\
     fprintf(stderr, "Error in %s(): " message "\n", __func__, ##__VA_ARGS__);\
@@ -100,48 +101,67 @@ void writeSlice(
     free(buffer);
 }
 
+void writeParameters(FILE *srcFile, FILE *destFile, boot_img_hdr *header){
+
+}
+
 int main(int argsLen, char **args){
-    char src[PATHLEN_MAX] = "";
-    char dests[][PATHLEN_MAX] = {
+    char *src;
+    char *srcDir; size_t srcDirLen = 0;
+    char *dests[] = {
         "parameters.txt",
         "kernel.img",
         "ramdisk.img",
         "secondary.img",
         ""
     };
-    char
-        destKernel[PATHLEN_MAX] = "kernel.img",
-        destRamdisk[PATHLEN_MAX] = "ramdisk.img",
-        destSecondary[PATHLEN_MAX] = "secondary.img"
-    ;
+    FILE *srcFile = NULL, *destFile = NULL;
     boot_img_hdr header;
     uint32_t pageMap[4];
 
+    // Open srcFile
     if(argsLen < 2) throwError("src not specified");
-    snprintf(src, PATHLEN_MAX, "%s", args[1]);
+    src = args[1];
+    srcFile = openFile(src, "r");
 
-    FILE *srcFile = openFile(src, "r");
+    // Extract src's parent directory pathname, then chdir into it
+    errno = 0;
+    srcDirLen = (size_t)rindex(src, '/');
+    srcDirLen = (srcDirLen ? srcDirLen + 1 - (size_t)src : 0) + 1;
+    srcDir = malloc(srcDirLen);
+    if(errno) throwError("%s", strerror(errno));
+    if(srcDirLen > 1) memcpy(srcDir, src, srcDirLen - 1);
+    srcDir[srcDirLen - 1] = '\0';
+    chdir(srcDir);
+    if(errno) throwError(
+        "Failed to chdir into \"%s\". %s",
+        srcDir, strerror(errno)
+    );
 
+    // Read in header and calculate pageMap
     printf("Reading header...\n");
     readHeader(&header, srcFile);
     printf("Page size: %uB\n", header.page_size);
-
     getPageMap(pageMap, &header);
     printPageMap(pageMap);
 
+    // Extract slices based on pageMap, and dump them to to their
+    // respective dests.
     for(size_t i = 0, offset = 0; dests[i][0] != '\0'; i++){
-        FILE *destFile;
-        if(pageMap[i] && i > 0){
-            printf("Extracting \"%s\"...\n", dests[i]);
-            destFile = openFile(dests[i], "w");
-            writeSlice(
-                srcFile, destFile,
-                header.page_size, pageMap[i], offset
-            );
-            fclose(destFile);
-        }
+        printf("Extracting \"%s\"...\n", dests[i]);
+        destFile = openFile(dests[i], "w");
+        if(i == 0){}
+        else writeSlice(
+            srcFile, destFile,
+            header.page_size, pageMap[i], offset
+        );
+        fclose(destFile);
         offset += pageMap[i];
     }
+
+    // Cleanup
+    fclose(srcFile);
+    free(srcDir);
 
     return EXIT_SUCCESS;
 }
