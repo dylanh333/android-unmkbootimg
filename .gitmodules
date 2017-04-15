@@ -1,0 +1,3 @@
+[submodule "vendor/android-core"]
+	path = vendor/android-core
+	url = https://android.googlesource.com/platform/system/core
