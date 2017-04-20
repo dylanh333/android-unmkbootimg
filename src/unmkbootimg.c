@@ -39,12 +39,6 @@ SOFTWARE.
 
 #define BOOT_ID_SIZE (sizeof(uint32_t) * 8)
 
-// TODO: Rework slice map to measure eacb slice in bytes rather than pages, to
-// keep things consistent for the next todo
-// TODO: Output extacted slices to exact size specified in header, rather than
-// including padding to the nearest page
-// TODO: Make -s an optional parameter
-
 enum sliceIndex {
     SLICE_HEADER,
     SLICE_KERNEL,
