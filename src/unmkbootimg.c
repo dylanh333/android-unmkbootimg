@@ -190,7 +190,7 @@ void getImageId(
 			if(i >= 20){
 				j += snprintf(
 					imageId + j, IMAGE_ID_SIZE - j,
-					" sha1"
+					" (sha1)"
 				);
 				break;
 			} else separator = "";
@@ -206,6 +206,40 @@ void getImageId(
 			id[i], separator
 		);	
     }
+}
+
+void writeHeaderInfo(FILE *destFile, boot_img_hdr *header){
+	char osVersion[OS_VERSION_SIZE], osPatchLevel[OS_VERSION_SIZE];
+	char imageId[IMAGE_ID_SIZE];
+
+	fprintf(destFile, "Kernel size: %uB\n", header->kernel_size);
+	fprintf(destFile, "Kernel load address: %#x\n", header->kernel_addr);
+
+	fprintf(destFile, "Ramdisk size: %uB\n", header->ramdisk_size);
+	fprintf(destFile, "Ramdisk load address: %#x\n", header->ramdisk_addr);
+
+	fprintf(destFile, "Second size: %uB\n", header->second_size);
+	fprintf(destFile, "Second load address: %#x\n", header->second_addr);
+
+	fprintf(destFile, "Tags address: %#x\n", header->tags_addr);
+	fprintf(destFile, "Page size: %uB\n", header->page_size);
+
+	getOsVersion(osVersion, osPatchLevel, header);
+	fprintf(destFile, 
+		"Android version: %s\nAndroid patch Level: %s\n",
+		osVersion, osPatchLevel
+	);
+
+	fprintf(destFile, "Product name: \"%.*s\"\n", BOOT_NAME_SIZE, header->name);
+	
+	fprintf(destFile, 
+		"Command line (including extra): \"%.*s%.*s\"\n",
+		BOOT_ARGS_SIZE, header->cmdline,
+		BOOT_EXTRA_ARGS_SIZE, header->extra_cmdline
+	);
+
+	getImageId(imageId, header, false);
+	fprintf(destFile, "Image ID (eg. checksum): %s\n", imageId);
 }
 
 void writeSlice(
@@ -274,9 +308,10 @@ void writeMakeScript(
     if(header->second_size)
         fprintf(destFile, " --second \"%s\" \\\n", dests[3]);
     fprintf(
-        destFile, " --cmdline \"%s%s\" \\\n",
-        header->cmdline, header->extra_cmdline
-    );
+        destFile, " --cmdline \"%.*s%.*s\"\n",
+		BOOT_ARGS_SIZE, header->cmdline,
+		BOOT_EXTRA_ARGS_SIZE, header->extra_cmdline
+	);
     fprintf(destFile, " --base %#x \\\n", 0);
     fprintf(destFile, " --kernel_offset %#x \\\n", header->kernel_addr);
     fprintf(destFile, " --ramdisk_offset %#x \\\n", header->ramdisk_addr);
@@ -284,7 +319,7 @@ void writeMakeScript(
     fprintf(destFile, " --os_version \"%s\" \\\n", osVersion);
     fprintf(destFile, " --os_patch_level \"%s\" \\\n", osPatchLevel);
     fprintf(destFile, " --tags_offset %#x \\\n", header->tags_addr);
-    fprintf(destFile, " --board \"%s\" \\\n", header->name);
+    fprintf(destFile, " --board \"%.*s\" \\\n", BOOT_NAME_SIZE, header->name);
     fprintf(destFile, " --pagesize %#x \\\n", header->page_size);
     fprintf(destFile, " --output \"%s\"\n", dests[DEST_NEWBOOT]);
 
@@ -299,16 +334,17 @@ void writeMakeScript(
 
 void usage(char **args){
     printf(
-        "Usage: %s -s <src> [OPTIONS]\n\n"
+        "Usage: %s [OPTIONS] <src>\n\n"
         "Extracts the kernel, ramdisk, and second-stage bootloader from the\n"
         "provided Android boot image, and outputs them to the same directory.\n"
         "Furthermore, this also creates a remake script that recombines these\n"
         "extracted images into newboot.img, by running mkbootimg with the\n"
         "parameters extracted from the original image header of src.\n\n"
         "OPTIONS:\n"
-        "\t-s <src>: The source Android boot image file to extract from.\n"
+        "\t<src>: The source Android boot image file to extract from.\n"
         "\t-d <destDir>: Output extracted images here instead.\n"
         "\t-v: Verbose.\n"
+		"\t-i: Print header information only, then exit.\n"
         "\t-r <remakeScript>: Save the remake script using this filename\n"
         "\t\tinstead.\n"
         "\t-m <mkbootimgCmd>: Use this command in the remake script for\n"
@@ -323,7 +359,7 @@ void usage(char **args){
 int main(int argsLen, char **args){
     char *src = NULL;
     char *destDir = NULL; bool destDirMalloced = false;
-    char *dests[] = { //see sliceIndex
+    char *dests[] = { //see destIndex
         "remkbootimg.sh",
         "kernel.img",
         "ramdisk.img",
@@ -333,20 +369,16 @@ int main(int argsLen, char **args){
     FILE *srcFile = NULL, *destFile = NULL;
     boot_img_hdr header;
     uint32_t offsetMap[4], sizeMap[4];
-    char
-		osVersion[OS_VERSION_SIZE],
-		osPatchLevel[OS_VERSION_SIZE],
-		imageId[IMAGE_ID_SIZE]
-	;
-    bool verbose = false;
+    bool verbose = false, onlyPrintHeader = false;
     char *mkbootimgCmd = "mkbootimg";
 
     // Parse supplied arguments
     int opt = 0;
-    while((opt = getopt(argsLen, args, "s:d:vr:m:n:")) >= 0) switch(opt){
-        case 's': src = optarg; break;
+    while((opt = getopt(argsLen, args, "-s:d:vir:m:n:")) >= 0) switch(opt){
+		case 1: src = optarg; break;
         case 'd': destDir = optarg; break;
-        case 'v': verbose = true; break;
+        case 'v': verbose = true; onlyPrintHeader = false; break;
+		case 'i': onlyPrintHeader = true; verbose = false; break;
         case 'r': dests[DEST_MKSCRIPT] = optarg; break;
         case 'm': mkbootimgCmd = optarg; break;
         case 'n': dests[DEST_NEWBOOT] = optarg; break;
@@ -375,22 +407,15 @@ int main(int argsLen, char **args){
     readHeader(&header, srcFile);
     getSizeMap(sizeMap, &header);
     getOffsetMap(offsetMap, &header);
-    if(verbose){
-        printf("Page size: %uB\n", header.page_size);
-        printf("Kernel size: %uB\n", sizeMap[SLICE_KERNEL]);
-        printf("Ramdisk size: %uB\n", sizeMap[SLICE_RAMDISK]);
-        printf("Second size: %uB\n", sizeMap[SLICE_SECOND]);
-        getOsVersion(osVersion, osPatchLevel, &header);
-        printf("Android Version: %s; Patch Level: %s\n", osVersion, osPatchLevel);
-        getImageId(imageId, &header, false);
-        printf("Image ID: %s\n", imageId);
-    }
+    if(verbose) printf("---\n");
+	if(verbose || onlyPrintHeader) writeHeaderInfo(stdout, &header);
+	if(verbose) printf("---\n\n");
 
     // Extract slices based on offsetMap, and dump them to to their
     // respective dests.
-    for(size_t dest = 0; dest <= SLICE_SECOND; dest++){
+    if(!onlyPrintHeader) for(size_t dest = 0; dest <= SLICE_SECOND; dest++){
         if(sizeMap[dest] == 0) continue;
-        if(verbose) printf("Writing \"%s\"\n", dests[dest]);
+        if(verbose) printf("Writing \"%s\"...\n", dests[dest]);
         destFile = openFile(dests[dest], "w");
 
         switch(dest){
@@ -405,7 +430,7 @@ int main(int argsLen, char **args){
         }
 
         fclose(destFile);
-    }
+    };
 
     // Cleanup
     fclose(srcFile);
