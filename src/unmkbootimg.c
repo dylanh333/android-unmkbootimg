@@ -268,6 +268,47 @@ void writeHeaderInfo(FILE *destFile, boot_img_hdr *header){
 	fprintf(destFile, "Image ID (eg. checksum): %s\n", imageId);
 }
 
+void writeMakeScript(
+    FILE *destFile, char **dests,
+    const char *mkbootimgCmd, const boot_img_hdr *header
+){
+    char osVersion[12] = "", osPatchLevel[12] = "";
+
+    // Calculate version information
+    getOsVersion(osVersion, osPatchLevel, header);
+
+    // Write the script
+    fprintf(destFile, "#!/bin/sh\n");
+    fprintf(destFile, "%s \\\n", mkbootimgCmd);
+    fprintf(destFile, " --kernel \"%s\" \\\n", dests[1]);
+    fprintf(destFile, " --ramdisk \"%s\" \\\n", dests[2]);
+    if(header->second_size)
+        fprintf(destFile, " --second \"%s\" \\\n", dests[3]);
+    fprintf(
+        destFile, " --cmdline \"%.*s%.*s\"\\\n",
+		BOOT_ARGS_SIZE, header->cmdline,
+		BOOT_EXTRA_ARGS_SIZE, header->extra_cmdline
+	);
+    fprintf(destFile, " --base %#x \\\n", 0);
+    fprintf(destFile, " --kernel_offset %#x \\\n", header->kernel_addr);
+    fprintf(destFile, " --ramdisk_offset %#x \\\n", header->ramdisk_addr);
+    fprintf(destFile, " --second_offset %#x \\\n", header->second_addr);
+    fprintf(destFile, " --os_version \"%s\" \\\n", osVersion);
+    fprintf(destFile, " --os_patch_level \"%s\" \\\n", osPatchLevel);
+    fprintf(destFile, " --tags_offset %#x \\\n", header->tags_addr);
+    fprintf(destFile, " --board \"%.*s\" \\\n", BOOT_NAME_SIZE, header->name);
+    fprintf(destFile, " --pagesize %#x \\\n", header->page_size);
+    fprintf(destFile, " --output \"%s\"\n", dests[DEST_NEWBOOT]);
+
+    // Make sure the script is executable
+    errno = 0;
+    fchmod(fileno(destFile), 0750);
+    if(errno) throwWarning(
+        "Failed to change file mode to 0750. %s",
+        strerror(errno)
+    );
+}
+
 void writeSlice(
     FILE *srcFile, FILE *destFile,
     size_t blockSize, size_t byteOffset, size_t byteCount
@@ -315,47 +356,6 @@ void writeSlice(
     }
 
     free(buffer);
-}
-
-void writeMakeScript(
-    FILE *destFile, char **dests,
-    const char *mkbootimgCmd, const boot_img_hdr *header
-){
-    char osVersion[12] = "", osPatchLevel[12] = "";
-
-    // Calculate version information
-    getOsVersion(osVersion, osPatchLevel, header);
-
-    // Write the script
-    fprintf(destFile, "#!/bin/sh\n");
-    fprintf(destFile, "%s \\\n", mkbootimgCmd);
-    fprintf(destFile, " --kernel \"%s\" \\\n", dests[1]);
-    fprintf(destFile, " --ramdisk \"%s\" \\\n", dests[2]);
-    if(header->second_size)
-        fprintf(destFile, " --second \"%s\" \\\n", dests[3]);
-    fprintf(
-        destFile, " --cmdline \"%.*s%.*s\"\n",
-		BOOT_ARGS_SIZE, header->cmdline,
-		BOOT_EXTRA_ARGS_SIZE, header->extra_cmdline
-	);
-    fprintf(destFile, " --base %#x \\\n", 0);
-    fprintf(destFile, " --kernel_offset %#x \\\n", header->kernel_addr);
-    fprintf(destFile, " --ramdisk_offset %#x \\\n", header->ramdisk_addr);
-    fprintf(destFile, " --second_offset %#x \\\n", header->second_addr);
-    fprintf(destFile, " --os_version \"%s\" \\\n", osVersion);
-    fprintf(destFile, " --os_patch_level \"%s\" \\\n", osPatchLevel);
-    fprintf(destFile, " --tags_offset %#x \\\n", header->tags_addr);
-    fprintf(destFile, " --board \"%.*s\" \\\n", BOOT_NAME_SIZE, header->name);
-    fprintf(destFile, " --pagesize %#x \\\n", header->page_size);
-    fprintf(destFile, " --output \"%s\"\n", dests[DEST_NEWBOOT]);
-
-    // Make sure the script is executable
-    errno = 0;
-    fchmod(fileno(destFile), 0750);
-    if(errno) throwWarning(
-        "Failed to change file mode to 0750. %s",
-        strerror(errno)
-    );
 }
 
 void usage(char **args){
