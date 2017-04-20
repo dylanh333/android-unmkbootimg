@@ -11,9 +11,21 @@
 #include <getopt.h>
 #include "bootimg.h"
 
-// Destination filenames for each slice of the image
-// Slice 0 is the header, and doesn't get output directly:
-// A dump of parameters to mkbootimg is instead produced.
+#define BOOT_ID_SIZE (sizeof(uint32_t) * 8)
+
+// TODO: Rework slice map to measure eacb slice in bytes rather than pages, to
+// keep things consistent for the next todo
+// TODO: Output extacted slices to exact size specified in header, rather than
+// including padding to the nearest page
+// TODO: Make -s an optional parameter
+
+enum sliceIndex {
+    SLICE_HEADER,
+    SLICE_KERNEL,
+    SLICE_RAMDISK,
+    SLICE_SECOND
+};
+
 enum destsIndex {
     DEST_MKSCRIPT,
     DEST_KERNEL,
@@ -26,6 +38,9 @@ enum destsIndex {
     fprintf(stderr, "Error in %s(): " message "\n", __func__, ##__VA_ARGS__);\
     exit(EXIT_FAILURE);\
 }
+
+#define throwWarning(message, ...) \
+    fprintf(stderr, "Warning in %s(): " message "\n", __func__, ##__VA_ARGS__);
 
 FILE *openFile(const char *path, const char *mode){
     FILE *file = NULL; errno = 0;
@@ -81,38 +96,53 @@ void readHeader(boot_img_hdr *header, FILE *srcFile){
     if(header->ramdisk_size == 0) throwError("Invalid ramdisk_size");
 }
 
-void getSliceMap(uint32_t sliceMap[4], const boot_img_hdr *header){
-    uint32_t pageSize = header->page_size, sizeInBytes;
 
-    for(uint32_t i = 0; i < 4; i++){
-        switch(i){
-            default: sizeInBytes = pageSize; break;
-            case 1: sizeInBytes = header->kernel_size; break;
-            case 2: sizeInBytes = header->ramdisk_size; break;
-            case 3: sizeInBytes = header->second_size; break;
+/**
+ * Gets the actual size of all slices in the bootimg, without rounding up to
+ * the nearest page.
+ * Eg. sizeMap[SLICE_KERNEL] gives the size of the kernel slice
+ */
+void getSizeMap(uint32_t sizeMap[4], const boot_img_hdr *header){
+    for(int slice = 0; slice < 4; slice++){
+        uint32_t size;
+
+        switch(slice){
+            case SLICE_HEADER: size = sizeof(boot_img_hdr); break;
+            case SLICE_KERNEL: size = header->kernel_size; break;
+            case SLICE_RAMDISK: size = header->ramdisk_size; break;
+            case SLICE_SECOND: size = header->second_size; break;
+            default: size = 0;
         }
-        sliceMap[i] = (sizeInBytes + pageSize - 1) / pageSize;
+
+        sizeMap[slice] = size;
     }
 }
 
-void writeSliceMap(FILE *destFile, uint32_t sliceMap[4]){
-    for(char i = 0; i < 4; i++){
-        char *label;
-        switch(i){
-            case 0: label = "header"; break;
-            case 1: label = "kernel"; break;
-            case 2: label = "ramdisk"; break;
-            case 3: label = "second"; break;
-            default: "";
-        }
-        fprintf(
-            destFile,
-            "Size of \"%s\" slice: %u page%s\n",
-            label, sliceMap[i], sliceMap[i] == 1 ? "" : "s"
-        );
+/**
+ * Gets the offsets of all slices in the bootimg, with each slice page-aligned.
+ * Eg. offsetMap[SLICE_KERNEL] gives the offset of the kernel in the
+ * bootimg.
+ * offsetMap[SLICE_SECOND+1] gives the end of SLICE_SECOND
+ */
+void getOffsetMap(uint32_t offsetMap[4], const boot_img_hdr *header){
+    uint32_t pageSize = header->page_size;
+    uint32_t sizeMap[4];
+
+    getSizeMap(sizeMap, header);
+
+    offsetMap[0] = 0;
+    for(int slice = 0; slice < 3; slice++){
+        uint32_t currSliceSize = sizeMap[slice];
+
+        // Slice size in bytes is the kernel/ramdisk/second size, but rounded
+        // up to the nearest page.
+        currSliceSize = ((currSliceSize + pageSize - 1) / pageSize) * pageSize;
+
+        offsetMap[slice+1] = offsetMap[slice] + currSliceSize;
     }
 }
 
+#define OS_VERSION_SIZE 12
 void getOsVersion(
     char version[12], char patchLevel[12], const boot_img_hdr *header
 ){
@@ -137,29 +167,91 @@ void getOsVersion(
     snprintf(patchLevel, 11, "%04u-%02u-%02u", 2000 + y, m, d);
 }
 
+#define IMAGE_ID_SIZE (BOOT_ID_SIZE * 3 + 1)
+void getImageId(
+	char imageId[IMAGE_ID_SIZE],
+	const boot_img_hdr *header,
+	bool noSeparator
+){
+	// We want to deal with header->id one byte at a time, not one uint32_t
+    uint8_t *id = (void*)header->id;
+	bool isSha1 = true;
+	char *separator;
+	size_t i; //offset in id
+	int j; //offset in imageId string
+
+	// If the last three 32b uints of header->id are zero, then lets assume
+	// that the first 5 uints (160 bits) aren't, and that this is an sha1
+	// digest
+	for(i = 20; i < BOOT_ID_SIZE; i++) if(id[i] > 0) isSha1 = false;
+
+    for(i = 0, j = 0; i < BOOT_ID_SIZE && j < IMAGE_ID_SIZE - 1; i++){
+		if(isSha1){
+			if(i >= 20){
+				j += snprintf(
+					imageId + j, IMAGE_ID_SIZE - j,
+					" sha1"
+				);
+				break;
+			} else separator = "";
+		}else{
+			if(i == BOOT_ID_SIZE - 1) separator = "";
+			else if((i + 1) % 4 == 0) separator = " ";
+			else separator = ":";
+		}
+	
+        j += snprintf(
+			imageId + j, IMAGE_ID_SIZE - j,
+			"%02x%s",
+			id[i], separator
+		);	
+    }
+}
+
 void writeSlice(
     FILE *srcFile, FILE *destFile,
-    size_t pageSize, size_t pageCount, size_t offset
+    size_t blockSize, size_t byteOffset, size_t byteCount
 ){
+    int err = 0;
+
+    // Allocate a blockSized buffer to reduce fread operations and thus system
+    // call overhead
     void *buffer = NULL;
-    if(!(buffer = calloc(1, pageSize)))
-        throwError("Failed to allocate buffer. %s", strerror(errno));
+    if(!(buffer = calloc(1, blockSize))) throwError(
+        "Failed to allocate buffer of blockSize %luB. %s",
+        blockSize, strerror(errno)
+    );
 
-    fseek(srcFile, (long)(pageSize * offset), SEEK_SET);
-    for(size_t i = 0; i < pageCount; i++){
-        if(!fread(buffer, pageSize, 1, srcFile))
-            throwError(
-                "Failed to read an entire page at offset %lluB. %s",
-                (unsigned long long)((offset + i) * pageSize),
-                strerror(errno)
-            );
+    // Ensure that file is at the right position
+    fseek(srcFile, byteOffset, SEEK_SET);
+    rewind(destFile);
 
-        if(!fwrite(buffer, pageSize, 1, destFile))
-            throwError(
-                "Failed to write an entire page at offset %lluB. %s",
-                (unsigned long long)(i * pageSize),
-                strerror(errno)
-            );
+    // Begin extracting slice, one blockSize at a time
+    for(size_t i = 0; i < byteCount / blockSize + 1; i++){
+        size_t quota;
+
+        if((quota = byteCount - i * blockSize) < blockSize);
+        else quota = blockSize;
+        if(quota == 0) break;
+
+        if(fread(buffer, quota, 1, srcFile) < 1){
+            err = errno;
+            if(feof(srcFile)){
+                throwError(
+                    "Unexpected end of input. Current offset: %luB. %s",
+                    byteCount + i * blockSize, strerror(err)
+                );
+            }else{
+                throwError(
+                    "Failed to read file. Current offset: %luB. %s",
+                    byteCount + i * blockSize, strerror(err)
+                );
+            }
+        }
+
+        if(fwrite(buffer, quota, 1, destFile) < 1){
+            throwError("Failed to write to file. %s", strerror(errno));
+        }
     }
 
     free(buffer);
@@ -171,6 +263,10 @@ void writeMakeScript(
 ){
     char osVersion[12] = "", osPatchLevel[12] = "";
 
+    // Calculate version information
+    getOsVersion(osVersion, osPatchLevel, header);
+
+    // Write the script
     fprintf(destFile, "#!/bin/sh\n");
     fprintf(destFile, "%s \\\n", mkbootimgCmd);
     fprintf(destFile, " --kernel \"%s\" \\\n", dests[1]);
@@ -185,13 +281,20 @@ void writeMakeScript(
     fprintf(destFile, " --kernel_offset %#x \\\n", header->kernel_addr);
     fprintf(destFile, " --ramdisk_offset %#x \\\n", header->ramdisk_addr);
     fprintf(destFile, " --second_offset %#x \\\n", header->second_addr);
-    getOsVersion(osVersion, osPatchLevel, header);
     fprintf(destFile, " --os_version \"%s\" \\\n", osVersion);
     fprintf(destFile, " --os_patch_level \"%s\" \\\n", osPatchLevel);
     fprintf(destFile, " --tags_offset %#x \\\n", header->tags_addr);
     fprintf(destFile, " --board \"%s\" \\\n", header->name);
     fprintf(destFile, " --pagesize %#x \\\n", header->page_size);
     fprintf(destFile, " --output \"%s\"\n", dests[DEST_NEWBOOT]);
+
+    // Make sure the script is executable
+    errno = 0;
+    fchmod(fileno(destFile), 0750);
+    if(errno) throwWarning(
+        "Failed to change file mode to 0750. %s",
+        strerror(errno)
+    );
 }
 
 void usage(char **args){
@@ -220,7 +323,7 @@ void usage(char **args){
 int main(int argsLen, char **args){
     char *src = NULL;
     char *destDir = NULL; bool destDirMalloced = false;
-    char *dests[] = { //see destsIndex
+    char *dests[] = { //see sliceIndex
         "remkbootimg.sh",
         "kernel.img",
         "ramdisk.img",
@@ -229,7 +332,12 @@ int main(int argsLen, char **args){
     };
     FILE *srcFile = NULL, *destFile = NULL;
     boot_img_hdr header;
-    uint32_t sliceMap[4];
+    uint32_t offsetMap[4], sizeMap[4];
+    char
+		osVersion[OS_VERSION_SIZE],
+		osPatchLevel[OS_VERSION_SIZE],
+		imageId[IMAGE_ID_SIZE]
+	;
     bool verbose = false;
     char *mkbootimgCmd = "mkbootimg";
 
@@ -262,26 +370,41 @@ int main(int argsLen, char **args){
     }
     changeDir(destDir);
 
-    // Read in header and calculate sliceMap
+    // Read in header information
     if(verbose) printf("Reading header...\n");
     readHeader(&header, srcFile);
-    if(verbose) printf("Page size: %uB\n", header.page_size);
-    getSliceMap(sliceMap, &header);
-    if(verbose) writeSliceMap(stdout, sliceMap);
+    getSizeMap(sizeMap, &header);
+    getOffsetMap(offsetMap, &header);
+    if(verbose){
+        printf("Page size: %uB\n", header.page_size);
+        printf("Kernel size: %uB\n", sizeMap[SLICE_KERNEL]);
+        printf("Ramdisk size: %uB\n", sizeMap[SLICE_RAMDISK]);
+        printf("Second size: %uB\n", sizeMap[SLICE_SECOND]);
+        getOsVersion(osVersion, osPatchLevel, &header);
+        printf("Android Version: %s; Patch Level: %s\n", osVersion, osPatchLevel);
+        getImageId(imageId, &header, false);
+        printf("Image ID: %s\n", imageId);
+    }
 
-    // Extract slices based on sliceMap, and dump them to to their
+    // Extract slices based on offsetMap, and dump them to to their
     // respective dests.
-    for(size_t dest = 0, offset = 0; dest <= DEST_SECOND; dest++){
+    for(size_t dest = 0; dest <= SLICE_SECOND; dest++){
+        if(sizeMap[dest] == 0) continue;
         if(verbose) printf("Writing \"%s\"\n", dests[dest]);
         destFile = openFile(dests[dest], "w");
-        if(dest == DEST_MKSCRIPT)
-            writeMakeScript(destFile, dests, mkbootimgCmd, &header);
-        else writeSlice(
-            srcFile, destFile,
-            header.page_size, sliceMap[dest], offset
-        );
+
+        switch(dest){
+            case DEST_MKSCRIPT:
+                writeMakeScript(destFile, dests, mkbootimgCmd, &header);
+                break;
+            default:
+                writeSlice(
+                    srcFile, destFile,
+                    header.page_size, offsetMap[dest], sizeMap[dest]
+                );
+        }
+
         fclose(destFile);
-        offset += sliceMap[dest];
     }
 
     // Cleanup
