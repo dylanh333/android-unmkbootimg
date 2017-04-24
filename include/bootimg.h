@@ -1,0 +1,1 @@
+../vendor/android-tools/mkbootimg/bootimg.h
