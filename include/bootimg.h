@@ -1,1 +1,0 @@
-../vendor/android-core/mkbootimg/bootimg.h
